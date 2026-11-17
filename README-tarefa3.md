@@ -23,7 +23,7 @@ veja o [registro de validação](VALIDACAO-tarefa3.md).
 - Retorno com pergunta, palavras-chave, artigos e quantidade. A ordenação considera título, conteúdo e plataforma indicada, como Windows ou macOS.
 - Tratamento de autenticação ausente, entrada inválida e falhas na consulta ao GLPI.
 
-Nenhum modelo de IA é chamado. `history` é aceito e validado, mas não participa da pesquisa nesta tarefa. A busca usa os dados obtidos na requisição atual, sem cache compartilhado entre usuários. A pontuação não representa uma probabilidade de acerto; sinônimos ou perguntas muito diferentes do texto da base podem não encontrar um artigo existente.
+Nenhum modelo de IA é chamado. O frontend não envia mais o histórico: `/api/chat` recupera as últimas 10 mensagens do SQLite pelo `session_id` e devolve em `historico`. A busca usa os dados obtidos na requisição atual, sem cache compartilhado entre usuários. A pontuação não representa uma probabilidade de acerto; sinônimos ou perguntas muito diferentes do texto da base podem não encontrar um artigo existente.
 
 A configuração assíncrona do SQLAlchemy cria `database.db` na raiz do projeto
 quando a aplicação inicia e cria `chat_messages` e as tabelas `cache_*`
@@ -31,8 +31,7 @@ correspondentes aos domínios de `data/glpi_cache.json`. Os registros do cache
 são importados de forma idempotente; tokens e campos de credenciais são
 removidos antes da gravação. `src/crud.py` disponibiliza operações genéricas
 de criação, leitura, listagem, atualização e remoção, sem regras de negócio
-por domínio. O endpoint `/api/chat` ainda não grava nem recupera mensagens
-automaticamente.
+por domínio. O endpoint `/api/chat` grava a pergunta e a resposta e recupera o histórico automaticamente.
 
 `src/chat_memory.py` também disponibiliza `build_session_id(jwt_claims,
 conversation_id)` e `create_chat_memory(session_id)`. O gerenciador usa
@@ -95,7 +94,7 @@ Envie JSON com o cabeçalho `Content-Type: application/json` e autenticação `A
 ```json
 {
   "message": "Oi, bom dia, estou tentando configurar a VPN no Windows e preciso de ajuda",
-  "history": []
+  "session_id": "conversa-1"
 }
 ```
 

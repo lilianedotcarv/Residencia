@@ -3,11 +3,15 @@
 import asyncio
 import json
 import os
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 import requests
+from sqlalchemy import create_engine
 
+import src.chat_memory as chat_memory
 from src.main import app
 
 
@@ -79,6 +83,13 @@ class ChatAPITests(unittest.TestCase):
         )
         environment.start()
         self.addCleanup(environment.stop)
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        test_engine = create_engine(f"sqlite:///{(Path(temp_dir.name) / 'memory.db').as_posix()}")
+        self.addCleanup(test_engine.dispose)
+        engine_patch = patch.object(chat_memory, "chat_history_engine", test_engine)
+        engine_patch.start()
+        self.addCleanup(engine_patch.stop)
 
     def call(self, client, payload=None, **kwargs):
         with patch("src.main._new_glpi_client", return_value=client):
@@ -199,6 +210,68 @@ class ChatAPITests(unittest.TestCase):
         self.assertEqual(second_body["artigos"], [])
         self.assertEqual(second.calls, [("user-b-token", 0, 50)])
 
+    def test_history_is_restored_from_sqlite_for_the_same_session(self):
+        articles = [{"id": 1, "name": "VPN Windows", "content": "Configurar VPN Windows"}]
+        _, first_body = self.call(
+            ArticleClientStub(articles), {"message": "VPN Windows", "session_id": "conversa-1"}
+        )
+        _, second_body = self.call(
+            ArticleClientStub(articles), {"message": "VPN", "session_id": "conversa-1"}
+        )
+
+        self.assertEqual(first_body["session_id"], "conversa-1")
+        self.assertEqual(first_body["historico"], [])
+        self.assertEqual(
+            second_body["historico"],
+            [
+                {"role": "user", "content": "VPN Windows"},
+                {"role": "assistant", "content": "Artigos encontrados: [Artigo 1] VPN Windows"},
+            ],
+        )
+
+    def test_history_is_isolated_by_user_and_by_session(self):
+        articles = [{"id": 1, "name": "VPN Windows", "content": "Configurar VPN Windows"}]
+        self.call(ArticleClientStub(articles), {"message": "VPN", "session_id": "s1"}, token="user-a")
+        _, other_user = self.call(
+            ArticleClientStub(articles), {"message": "VPN", "session_id": "s1"}, token="user-b"
+        )
+        _, other_session = self.call(
+            ArticleClientStub(articles), {"message": "VPN", "session_id": "s2"}, token="user-a"
+        )
+
+        self.assertEqual(other_user["historico"], [])
+        self.assertEqual(other_session["historico"], [])
+
+    def test_session_id_is_generated_when_missing_and_can_be_reused(self):
+        articles = [{"id": 1, "name": "VPN Windows", "content": "Configurar VPN Windows"}]
+        _, first = self.call(ArticleClientStub(articles), {"message": "VPN"})
+        _, second = self.call(
+            ArticleClientStub(articles), {"message": "VPN", "session_id": first["session_id"]}
+        )
+
+        self.assertTrue(first["session_id"])
+        self.assertEqual(len(second["historico"]), 2)
+
+    def test_failed_search_does_not_persist_messages(self):
+        self.call(ArticleClientStub(status_code=500), {"message": "VPN", "session_id": "s1"})
+        _, body = self.call(ArticleClientStub([]), {"message": "VPN", "session_id": "s1"})
+
+        self.assertEqual(body["historico"], [])
+
+    def test_history_is_limited_to_the_last_ten_messages(self):
+        for turn in range(7):
+            _, body = self.call(
+                ArticleClientStub([]), {"message": f"pergunta {turn}", "session_id": "s1"}
+            )
+
+        self.assertEqual(len(body["historico"]), 10)
+        self.assertEqual(body["historico"][0]["content"], "pergunta 1")
+
+    def test_client_history_is_rejected(self):
+        status, _ = self.call(
+            ArticleClientStub(), {"message": "VPN", "history": [{"role": "user", "content": "Oi"}]}
+        )
+        self.assertEqual(status, 422)
 
 if __name__ == "__main__":
     unittest.main()

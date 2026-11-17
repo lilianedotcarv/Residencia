@@ -1,3 +1,4 @@
+import hashlib
 import logging
 import os
 import uuid
@@ -29,7 +30,13 @@ from src.config.pydantic.jwt import decode_glpi_jwt
 from src.config.pydantic.chat import ChatResponse
 from src.config.pydantic.request import PydanticRequestValidationMiddleware
 from src.errors import GLPIConfigError, GLPIError, erro_glpi_por_status, register_error_handlers
-from src.chat_memory import chat_history_engine
+from src.chat_memory import (
+    build_session_id,
+    chat_history_engine,
+    create_chat_memory,
+    format_answer,
+    load_history,
+)
 from src.crud import import_cache
 from src.database import engine, init_db
 from src.domain_service import DomainService
@@ -319,13 +326,26 @@ def list_users(
 ) -> Response:
     return _call_glpi(context, "users", start=pagination.start, limit=pagination.limit)
 
+def _memory_user_claims(context: GLPIAuthContext) -> dict[str, Any]:
+    claims = context.jwt_claims
+    if isinstance(claims, dict) and str(claims.get("sub") or "").strip():
+        return claims
+    token = getattr(context.client, "access_token", None) or "anonymous"
+    return {"sub": hashlib.sha256(token.encode()).hexdigest()[:32]} 
 
 @app.post("/api/chat", response_model=ChatResponse)
 def chat(
     payload: ChatRequest, context: GLPIAuthContext = Depends(get_glpi_auth_context),
 ) -> dict[str, Any]:
     try:
-        return processar_pergunta(payload.message, context.client)
+        conversation_id = payload.session_id or str(uuid.uuid4())
+        memory = create_chat_memory(
+            build_session_id(_memory_user_claims(context), conversation_id)
+        )
+        historico = load_history(memory)
+        result = processar_pergunta(payload.message, context.client)
+        memory.save_context({"input": result["pergunta"]}, {"output": format_answer(result)})
+        return {**result, "session_id": conversation_id, "historico": historico}
     except requests.Timeout as exc:
         raise HTTPException(status_code=504, detail="O GLPI demorou para responder à consulta de artigos.") from exc
     except requests.RequestException as exc:
