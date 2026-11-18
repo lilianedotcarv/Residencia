@@ -25,7 +25,8 @@ from src.config.pydantic import (
 from src.config.pydantic.chat import MAX_MESSAGE_LENGTH
 from src.config.pydantic.jwt import decode_glpi_jwt
 from src.config.pydantic.request import APIRequestEnvelope, PydanticRequestValidationMiddleware
-from src.main import app, get_glpi_auth_context, list_tickets, me
+from src.main import app, get_glpi_auth_context, list_tickets
+from src.session_store import session_store
 
 
 class APIValidationTests(unittest.TestCase):
@@ -88,20 +89,26 @@ class APIValidationTests(unittest.TestCase):
         self.assertEqual(decode_glpi_jwt(token), {"sub": "user-1"})
         self.assertIsNone(decode_glpi_jwt("not-a-jwt"))
 
-    def test_bearer_interceptor_does_not_require_the_glpi_me_scope(self):
+    def test_session_token_authenticates_api_and_glpi_client_uses_service_token(self):
         class GLPIClientStub:
             def __init__(self):
-                self.access_token = None
+                self.access_token = "server-glpi-jwt"
 
-            def me(self):
-                return {
-                    "status_code": 403,
-                    "data": {"detail": "You do not have the required scope(s) to access this endpoint."},
-                }
+            def ticket_list(self, *, start, limit):
+                del start, limit
+                return {"status_code": 206, "data": [{"id": 1}]}
 
         payload = base64.urlsafe_b64encode(json.dumps({"sub": "user-1"}).encode()).decode().rstrip("=")
         signature = base64.urlsafe_b64encode(b"signature").decode().rstrip("=")
-        token = f"e30.{payload}.{signature}"
+        glpi_token = f"e30.{payload}.{signature}"
+        session_token = "application-session-token"
+        session_store.clear()
+        self.addCleanup(session_store.clear)
+        session_store.create_session(
+            "session-user-1",
+            {"id": 7, "name": "ana"},
+            token=session_token,
+        )
         request = Request(
             {
                 "type": "http",
@@ -122,24 +129,21 @@ class APIValidationTests(unittest.TestCase):
         with patch("src.main._new_glpi_client", return_value=client):
             context = get_glpi_auth_context(
                 request,
-                HTTPAuthorizationCredentials(scheme="Bearer", credentials=token),
+                HTTPAuthorizationCredentials(scheme="Bearer", credentials=session_token),
             )
 
-        self.assertEqual(context.client.access_token, token)
-        self.assertEqual(context.jwt_claims, {"sub": "user-1"})
-        from src.errors import GLPIError
-
-        with self.assertRaises(GLPIError) as erro:
-            me(context)
-        self.assertEqual(erro.exception.status_code, 403)
-        self.assertEqual(erro.exception.codigo, "GLPI_SEM_PERMISSAO")
-        class TicketClientStub:
-            def ticket_list(self, *, start, limit):
-                return {"status_code": 206, "data": [{"id": 1}]}
-
-        ticket_context = type(context)(client=TicketClientStub(), user=None, jwt_claims=context.jwt_claims)
-        response = list_tickets(PaginationParams(start=0, limit=1), ticket_context)
+        self.assertEqual(context.client.access_token, "server-glpi-jwt")
+        self.assertEqual(context.user, {"id": 7, "name": "ana"})
+        self.assertEqual(context.jwt_claims, {"sub": "7"})
+        response = list_tickets(PaginationParams(start=0, limit=1), context)
         self.assertEqual(response.status_code, 206)
+
+        with self.assertRaises(HTTPException) as error:
+            get_glpi_auth_context(
+                request,
+                HTTPAuthorizationCredentials(scheme="Bearer", credentials=glpi_token),
+            )
+        self.assertEqual(error.exception.status_code, 401)
 
     def test_auth_interceptor_requires_bearer_unless_development_bypass_is_enabled(self):
         request = Request(
@@ -285,6 +289,55 @@ class APIValidationTests(unittest.TestCase):
         sent = asyncio.run(run_request())
         self.assertEqual(sent[0]["status"], 422)
 
+    def test_chat_cors_preflight_allows_local_frontend_origin(self):
+        async def run_preflight():
+            sent = []
+
+            async def receive():
+                return {"type": "http.request", "body": b"", "more_body": False}
+
+            async def send(message):
+                sent.append(message)
+
+            scope = {
+                "type": "http",
+                "asgi": {"version": "3.0", "spec_version": "2.3"},
+                "http_version": "1.1",
+                "method": "OPTIONS",
+                "scheme": "http",
+                "path": "/api/chat",
+                "raw_path": b"/api/chat",
+                "query_string": b"",
+                "root_path": "",
+                "headers": [
+                    (b"origin", b"http://localhost:5173"),
+                    (b"access-control-request-method", b"POST"),
+                    (b"access-control-request-headers", b"authorization,content-type"),
+                ],
+                "server": ("testserver", 80),
+                "client": ("testclient", 1),
+                "state": {},
+            }
+            await app(scope, receive, send)
+            status = next(
+                message["status"]
+                for message in sent
+                if message["type"] == "http.response.start"
+            )
+            headers = dict(
+                (key.lower(), value.lower())
+                for message in sent
+                if message["type"] == "http.response.start"
+                for key, value in message["headers"]
+            )
+            return status, headers
+
+        status, headers = asyncio.run(run_preflight())
+        self.assertEqual(status, 200)
+        self.assertEqual(headers[b"access-control-allow-origin"], b"http://localhost:5173")
+        self.assertIn(b"post", headers[b"access-control-allow-methods"])
+        self.assertIn(b"authorization", headers[b"access-control-allow-headers"])
+
     def test_fastapi_routes_apply_global_and_endpoint_pydantic_validation(self):
         async def send_request(method, path, payload=None):
             body = json.dumps(payload).encode() if payload is not None else b""
@@ -336,9 +389,13 @@ class APIValidationTests(unittest.TestCase):
             engine_patch = patch.object(chat_memory, "chat_history_engine", test_engine)
             engine_patch.start()
             try:
-                health_status, _ = asyncio.run(send_request("GET", "/health"))
-                invalid_status, _ = asyncio.run(send_request("POST", "/api/chat", {"message": " "}))
-                chat_status, _ = asyncio.run(send_request("POST", "/api/chat", {"message": "Olá"}))
+                with patch(
+                    "src.main.generate_chat_response",
+                    return_value="Olá! Como posso ajudar?",
+                ):
+                    health_status, _ = asyncio.run(send_request("GET", "/health"))
+                    invalid_status, _ = asyncio.run(send_request("POST", "/api/chat", {"message": " "}))
+                    chat_status, _ = asyncio.run(send_request("POST", "/api/chat", {"message": "Olá"}))
             finally:
                 app.dependency_overrides.pop(get_glpi_auth_context, None)
                 engine_patch.stop()

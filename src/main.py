@@ -1,17 +1,22 @@
 import hashlib
+import asyncio
 import logging
 import os
+import secrets
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any, AsyncIterator
 
+import httpx
 import requests
 import uvicorn
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from sqlalchemy import select
 
 from src.config.pydantic import (
     ChatRequest,
@@ -26,19 +31,18 @@ from src.config.pydantic import (
     UserIdentificationResponse,
     validation_bypassed,
 )
-from src.config.pydantic.jwt import decode_glpi_jwt
-from src.config.pydantic.chat import ChatResponse
+from src.config.pydantic.chat import ChatResponse, ChatSessionResponse
 from src.config.pydantic.request import PydanticRequestValidationMiddleware
 from src.errors import GLPIConfigError, GLPIError, erro_glpi_por_status, register_error_handlers
+from src.chat_agent import generate_chat_response
 from src.chat_memory import (
     build_session_id,
     chat_history_engine,
     create_chat_memory,
-    format_answer,
     load_history,
 )
-from src.crud import import_cache
-from src.database import engine, init_db
+from src.crud import GenericCRUD, import_cache
+from src.database import AsyncSessionLocal, CACHE_TABLES, engine, init_db
 from src.domain_service import DomainService
 from src.glpi_client import GLPIClient
 from src.knowledge_service import ArticlesFetchError, processar_pergunta
@@ -60,6 +64,24 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
 
 app = FastAPI(title="GLPI Chat Bot API", version="1.0.0", lifespan=lifespan)
 app.add_middleware(PydanticRequestValidationMiddleware)
+cors_allowed_origins = [
+    origin.strip()
+    for origin in os.getenv("CORS_ALLOWED_ORIGINS", "").split(",")
+    if origin.strip()
+]
+cors_origin_regex = (
+    None
+    if cors_allowed_origins
+    else r"^https?://(?:localhost|127\.0\.0\.1|\[::1\])(?::\d+)?$"
+)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=cors_allowed_origins,
+    allow_origin_regex=cors_origin_regex,
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
+)
 register_error_handlers(app)
 bearer_scheme = HTTPBearer(auto_error=False)
 
@@ -82,36 +104,64 @@ class GLPIAuthContext:
     client: GLPIClient
     user: Any
     jwt_claims: dict[str, Any] | None
+    initial_chat_session: bool = False
+    session_id: str | None = None
 
 
 def _new_glpi_client() -> GLPIClient:
-    return GLPIClient(base_url=os.getenv("GLPI_BASE_URL"))
+    return GLPIClient(
+        base_url=os.getenv("GLPI_BASE_URL"),
+        username=os.getenv("GLPI_USERNAME"),
+        password=os.getenv("GLPI_PASSWORD"),
+    )
 
 
 def get_glpi_auth_context(
     request: Request,
     credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
 ) -> GLPIAuthContext:
+    if request.url.path == "/api/chat" and credentials is None:
+        context = GLPIAuthContext(
+            client=_new_glpi_client(),
+            user=None,
+            jwt_claims=None,
+            initial_chat_session=True,
+        )
+        request.state.glpi_auth = context
+        return context
+
+    if credentials is not None and credentials.scheme.lower() == "bearer":
+        session = session_store.get_session_by_token(credentials.credentials)
+        if session is not None:
+            user = session["user"]
+            context = GLPIAuthContext(
+                client=_new_glpi_client(),
+                user=user,
+                jwt_claims={"sub": str(user["id"])},
+                session_id=session["session_id"],
+            )
+            request.state.glpi_auth = context
+            return context
+
     if validation_bypassed():
-        context = GLPIAuthContext(client=_new_glpi_client(), user=None, jwt_claims=None)
+        context = GLPIAuthContext(
+            client=_new_glpi_client(),
+            user=None,
+            jwt_claims=None,
+        )
         request.state.glpi_auth = context
         return context
     if credentials is None or credentials.scheme.lower() != "bearer":
         raise HTTPException(
             status_code=401,
-            detail="Envie um token GLPI no cabeçalho Authorization: Bearer.",
+            detail="Envie um token de sessão válido no cabeçalho Authorization: Bearer.",
             headers={"WWW-Authenticate": "Bearer"},
         )
-
-    client = _new_glpi_client()
-    client.access_token = credentials.credentials
-    context = GLPIAuthContext(
-        client=client,
-        user=None,
-        jwt_claims=decode_glpi_jwt(credentials.credentials),
+    raise HTTPException(
+        status_code=401,
+        detail="O token de sessão é inválido ou expirou.",
+        headers={"WWW-Authenticate": "Bearer"},
     )
-    request.state.glpi_auth = context
-    return context
 
 
 def _executar_glpi(funcao: Any, *args: Any, **kwargs: Any) -> Any:
@@ -146,6 +196,153 @@ def _proxy_token_response(client: GLPIClient, payload: Any) -> Response:
 def _call_glpi(context: GLPIAuthContext, operation: str, *args: Any, **kwargs: Any) -> Response:
     result = _executar_glpi(getattr(context.client, operation), *args, **kwargs)
     return _proxy_response(result)
+
+
+def _emails_from_user(user: dict[str, Any]) -> set[str]:
+    emails: set[str] = set()
+    email = user.get("email")
+    if isinstance(email, str) and email.strip():
+        emails.add(email.strip().casefold())
+
+    raw_emails = user.get("emails")
+    extra = user.get("extra")
+    if isinstance(extra, dict):
+        raw_emails = [raw_emails, extra.get("emails")]
+    for entries in raw_emails if isinstance(raw_emails, list) else [raw_emails]:
+        if isinstance(entries, list):
+            candidates = entries
+        else:
+            candidates = [entries]
+        for candidate in candidates:
+            value = candidate.get("email") if isinstance(candidate, dict) else candidate
+            if isinstance(value, str) and value.strip():
+                emails.add(value.strip().casefold())
+    return emails
+
+
+def _users_from_ticket_cache(tickets: list[Any], username: str) -> list[dict[str, Any]]:
+    normalized_username = username.strip().casefold()
+    users_by_id: dict[str, dict[str, Any]] = {}
+    for ticket in tickets:
+        if not isinstance(ticket, dict):
+            continue
+        extra = ticket.get("extra")
+        team = ticket.get("team") or (
+            extra.get("team") if isinstance(extra, dict) else []
+        )
+        if not isinstance(team, list):
+            continue
+        for member in team:
+            if not isinstance(member, dict):
+                continue
+            member_name = str(member.get("name") or "").strip()
+            member_id = member.get("id")
+            if (
+                not member_name
+                or member_name.casefold() != normalized_username
+                or member_id is None
+                or member.get("type") not in (None, "User")
+            ):
+                continue
+            users_by_id.setdefault(
+                str(member_id),
+                {
+                    "id": member_id,
+                    "username": member_name,
+                    "realname": member.get("realname"),
+                    "firstname": member.get("firstname"),
+                    "email": member.get("email"),
+                },
+            )
+    return list(users_by_id.values())
+
+
+async def _fetch_and_cache_chat_users() -> list[dict[str, Any]]:
+    client = _new_glpi_client()
+    users = await asyncio.to_thread(_executar_glpi, client.get_all_users)
+    if not isinstance(users, list) or any(
+        not isinstance(user, dict) or user.get("id") is None for user in users
+    ):
+        raise GLPIError(
+            "O GLPI retornou uma lista de usuários inválida.",
+            codigo="GLPI_RESPOSTA_INVALIDA",
+        )
+
+    async with AsyncSessionLocal() as db_session:
+        crud = GenericCRUD(db_session)
+        for user in users:
+            await crud.upsert_by_source_key("users", str(user["id"]), user)
+        await db_session.commit()
+
+    return users
+
+
+def _matching_chat_users(
+    users: list[Any],
+    username: str,
+    email: str | None,
+) -> list[dict[str, Any]]:
+    normalized_username = username.strip().casefold()
+    normalized_email = email.strip().casefold() if email else None
+    return [
+        user
+        for user in users
+        if isinstance(user, dict)
+        and str(user.get("username") or user.get("name") or "").strip().casefold()
+        == normalized_username
+        and (
+            normalized_email is None
+            or normalized_email in _emails_from_user(user)
+        )
+    ]
+
+
+async def _find_chat_user(username: str, email: str | None = None) -> dict[str, Any]:
+    async with AsyncSessionLocal() as db_session:
+        result = await db_session.execute(select(CACHE_TABLES["users"].c.data))
+        users = result.scalars().all()
+
+    matching_users = _matching_chat_users(users, username, email)
+    glpi_error: GLPIConfigError | requests.RequestException | None = None
+    if not matching_users:
+        try:
+            users = await _fetch_and_cache_chat_users()
+            matching_users = _matching_chat_users(users, username, email)
+        except (GLPIConfigError, requests.RequestException) as exc:
+            glpi_error = exc
+            logger.warning(
+                "Consulta de usuários ao GLPI falhou; tentando o cache de tickets: %s",
+                exc,
+            )
+
+    if not matching_users and email is None:
+        async with AsyncSessionLocal() as db_session:
+            result = await db_session.execute(select(CACHE_TABLES["tickets"].c.data))
+            tickets = result.scalars().all()
+        matching_users = _users_from_ticket_cache(tickets, username)
+
+    if not matching_users:
+        if glpi_error is not None:
+            raise glpi_error
+        raise HTTPException(status_code=404, detail="Usuário não encontrado no banco de dados.")
+    if len(matching_users) > 1:
+        raise HTTPException(status_code=409, detail="Mais de um usuário corresponde aos dados informados.")
+    user = matching_users[0]
+    if not user.get("is_active", True):
+        raise HTTPException(status_code=403, detail="O usuário está inativo.")
+
+    user_id = user.get("id")
+    stored_name = user.get("username") or user.get("name")
+    if user_id is None or not stored_name:
+        raise HTTPException(status_code=502, detail="O registro do usuário no banco está incompleto.")
+    return {
+        "id": user_id,
+        "name": stored_name,
+        "realname": user.get("realname"),
+        "firstname": user.get("firstname"),
+        "email": user.get("email") or email,
+        "is_active": True,
+    }
 
 
 @app.post("/api/auth/token")
@@ -333,19 +530,54 @@ def _memory_user_claims(context: GLPIAuthContext) -> dict[str, Any]:
     token = getattr(context.client, "access_token", None) or "anonymous"
     return {"sub": hashlib.sha256(token.encode()).hexdigest()[:32]} 
 
-@app.post("/api/chat", response_model=ChatResponse)
-def chat(
-    payload: ChatRequest, context: GLPIAuthContext = Depends(get_glpi_auth_context),
-) -> dict[str, Any]:
+@app.post("/api/chat", response_model=ChatResponse | ChatSessionResponse)
+async def chat(
+    payload: ChatRequest,
+    context: GLPIAuthContext = Depends(get_glpi_auth_context),
+) -> dict[str, Any] | ChatSessionResponse:
+    if context.initial_chat_session:
+        username, separator, email = payload.message.rpartition(" - ")
+        username = username.strip() if separator else payload.message.strip()
+        email = email.strip() if separator else None
+        if (
+            not username
+            or (
+                separator
+                and (
+                    not email
+                    or "@" not in email
+                    or any(character.isspace() for character in email)
+                )
+            )
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="A primeira mensagem deve ser um username ou estar no formato 'username - email'.",
+            )
+
+        user = await _find_chat_user(username, email)
+        session_id = payload.session_id or str(uuid.uuid4())
+        session_token = secrets.token_urlsafe(32)
+        if not session_store.create_session(session_id, user, token=session_token):
+            raise HTTPException(status_code=409, detail="O ID de sessão informado já está em uso.")
+        return ChatSessionResponse(
+            message="Usuário identificado. Use o token retornado nas próximas mensagens desta sessão.",
+            session_id=session_id,
+            session_token=session_token,
+            user=user,
+        )
+
+    conversation_id = payload.session_id or context.session_id or str(uuid.uuid4())
     try:
-        conversation_id = payload.session_id or str(uuid.uuid4())
         memory = create_chat_memory(
             build_session_id(_memory_user_claims(context), conversation_id)
         )
         historico = load_history(memory)
-        result = processar_pergunta(payload.message, context.client)
-        memory.save_context({"input": result["pergunta"]}, {"output": format_answer(result)})
-        return {**result, "session_id": conversation_id, "historico": historico}
+        result = await asyncio.to_thread(
+            processar_pergunta,
+            payload.message,
+            context.client,
+        )
     except requests.Timeout as exc:
         raise HTTPException(status_code=504, detail="O GLPI demorou para responder à consulta de artigos.") from exc
     except requests.RequestException as exc:
@@ -357,11 +589,33 @@ def chat(
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
+    try:
+        message = await asyncio.to_thread(
+            generate_chat_response,
+            payload.message,
+            result,
+            historico,
+        )
+    except httpx.TimeoutException as exc:
+        raise HTTPException(status_code=504, detail="O agente de IA demorou para responder.") from exc
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail="Não foi possível consultar o agente de IA.") from exc
+
+    memory.save_context({"input": result["pergunta"]}, {"output": message})
+    return {
+        **result,
+        "message": message,
+        "session_id": conversation_id,
+        "historico": historico,
+    }
+
 
 @app.post("/api/session/identify", response_model=UserIdentificationResponse)
-def identify_user(request: UserIdentificationRequest) -> UserIdentificationResponse:
-    glpi_client = _new_glpi_client()
-    response = glpi_client.users(start=0, limit=100)
+def identify_user(
+    request: UserIdentificationRequest,
+    context: GLPIAuthContext = Depends(get_glpi_auth_context),
+) -> UserIdentificationResponse:
+    response = context.client.users(start=0, limit=100)
 
     if response.get("status_code") != 200:
         raise HTTPException(
@@ -377,7 +631,8 @@ def identify_user(request: UserIdentificationRequest) -> UserIdentificationRespo
         raise HTTPException(status_code=404, detail=result["message"])
 
     session_id = request.session_id or str(uuid.uuid4())
-    session_store.save_session(session_id, result["user"])
+    if not session_store.create_session(session_id, result["user"]):
+        raise HTTPException(status_code=409, detail="O ID de sessão informado já está em uso.")
     return UserIdentificationResponse(
         message=result["message"],
         session_id=session_id,

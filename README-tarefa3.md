@@ -1,6 +1,8 @@
-# Tarefa 3 — processar perguntas e buscar artigos no GLPI
+# Tarefa 3 — responder perguntas com artigos do GLPI
 
-A tarefa recebe o texto de uma pergunta, identifica palavras-chave e retorna até três artigos relevantes da base de conhecimento do GLPI. O endpoint é `POST /api/chat`.
+A tarefa recebe uma pergunta, consulta até três artigos relevantes no GLPI e
+usa um agente LangChain para produzir uma resposta clara. O endpoint é
+`POST /api/chat`.
 
 Esta cópia está na branch `feat/tarefa3-processamento-perguntas`, baseada na
 atualização `cd2572a` da `main` e na contribuição anterior de busca de artigos.
@@ -19,11 +21,19 @@ veja o [registro de validação](VALIDACAO-tarefa3.md).
 
 - Validação de `message`: texto não vazio, com até 4.000 caracteres.
 - Extração local de palavras-chave, sem repetição e na ordem da pergunta; normalização de acentos, maiúsculas, `e-mail/email` e `wi-fi/wi fi/wifi`; remoção de saudações e termos conversacionais.
-- Consulta paginada ao GLPI com o token Bearer recebido do usuário. A opção implementada consulta os artigos disponíveis para esse token e filtra o retorno localmente por relevância lexical.
-- Retorno com pergunta, palavras-chave, artigos e quantidade. A ordenação considera título, conteúdo e plataforma indicada, como Windows ou macOS.
-- Tratamento de autenticação ausente, entrada inválida e falhas na consulta ao GLPI.
+- Primeira mensagem sem Bearer com `username` ou `username - email`: busca a conta em `cache_users` (o username precisa ser único se o e-mail não for enviado) e emite um token local de sessão. O token identifica a sessão e é exigido nas rotas protegidas, mas não comprova a identidade nem é enviado ao GLPI; o backend usa as credenciais configuradas no servidor para obter o JWT de serviço.
+- Retorno com uma mensagem clara redigida pelo agente LangChain, além da pergunta, palavras-chave, artigos e quantidade. A ordenação considera título, conteúdo e plataforma indicada, como Windows ou macOS.
+- Tratamento de identificação ausente ou inválida, entrada inválida e falhas na consulta ao GLPI.
 
-Nenhum modelo de IA é chamado. O frontend não envia mais o histórico: `/api/chat` recupera as últimas 10 mensagens do SQLite pelo `session_id` e devolve em `historico`. A busca usa os dados obtidos na requisição atual, sem cache compartilhado entre usuários. A pontuação não representa uma probabilidade de acerto; sinônimos ou perguntas muito diferentes do texto da base podem não encontrar um artigo existente.
+O agente recebe a pergunta, o histórico recuperado do SQLite e os resultados
+obtidos naquela requisição. O histórico é separado por usuário autenticado e
+`session_id`; o frontend não precisa reenviá-lo. Configure
+`LANGCHAIN_CHAT_MODEL` no formato `provider:model` e as credenciais exigidas
+pelo provedor escolhido; sem essa configuração, `POST /api/chat` retorna HTTP
+503. Os outros endpoints REST não passam pelo agente. A busca usa os dados
+obtidos na requisição atual, sem cache compartilhado entre usuários. A
+pontuação não representa uma probabilidade de acerto; sinônimos ou perguntas
+muito diferentes do texto da base podem não encontrar um artigo existente.
 
 A configuração assíncrona do SQLAlchemy cria `database.db` na raiz do projeto
 quando a aplicação inicia e cria `chat_messages` e as tabelas `cache_*`
@@ -33,17 +43,12 @@ removidos antes da gravação. `src/crud.py` disponibiliza operações genérica
 de criação, leitura, listagem, atualização e remoção, sem regras de negócio
 por domínio. O endpoint `/api/chat` grava a pergunta e a resposta e recupera o histórico automaticamente.
 
-`src/chat_memory.py` também disponibiliza `build_session_id(jwt_claims,
-conversation_id)` e `create_chat_memory(session_id)`. O gerenciador usa
-`SQLChatMessageHistory` e `ConversationBufferWindowMemory`, mantendo no contexto
-as últimas dez mensagens e restaurando-as do SQLite para o mesmo `session_id`.
-O JWT GLPI observado contém o usuário em `sub`, mas não contém um ID de
-conversa; por isso, o chamador deve fornecer esse ID separadamente. Para usar
-a memória numa integração futura, carregue com
-`memory.load_memory_variables({})` e persista cada interação com
-`memory.save_context({"input": pergunta}, {"output": resposta})`. A classe
-`ConversationBufferWindowMemory` está depreciada pelo LangChain, mas foi usada
-para atender ao requisito desta implementação básica.
+`src/chat_memory.py` usa `SQLChatMessageHistory` e
+`ConversationBufferWindowMemory` para manter as últimas dez mensagens no
+SQLite e restaurá-las para a conversa autenticada. O ID de memória combina o
+usuário associado ao token de sessão com o `session_id`. A classe
+`ConversationBufferWindowMemory` está depreciada pelo LangChain, mas permanece
+no fluxo existente.
 
 ## Abrir e iniciar o projeto
 
@@ -102,6 +107,7 @@ A resposta 200 tem esta estrutura. O exemplo vazio abaixo apenas ilustra o contr
 
 ```json
 {
+  "message": "Encontrei um artigo sobre configuração de VPN no Windows.",
   "pergunta": "Oi, bom dia, estou tentando configurar a VPN no Windows e preciso de ajuda",
   "palavras_chave": ["configurar", "vpn", "windows", "ajuda"],
   "artigos": [],

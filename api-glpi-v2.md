@@ -215,21 +215,44 @@ Confirmado ao vivo:
   tipos usando modelos Pydantic específicos; a validação por rota não substitui
   essa validação global.
 
-  Em uso normal, envie um access token OAuth2 do GLPI como
-  `Authorization: Bearer <token>`. O serviço valida o token consultando
-  `/Administration/User/Me` no GLPI. Se o token tiver formato JWT, seus claims
-  são decodificados depois dessa validação remota; o conteúdo localmente
-  decodificado não é usado para autenticar. Tokens opacos também são aceitos
-  quando o GLPI os reconhece.
+  O preflight CORS permite origens HTTP(S) locais (`localhost`, `127.0.0.1`
+  ou `[::1]`) em qualquer porta. Para outros frontends, configure
+  `CORS_ALLOWED_ORIGINS` com uma lista de origens separadas por vírgula; ao
+  defini-la, a allowlist substitui a regra local.
+
+  Para iniciar uma sessão, omita `Authorization` em `POST /api/chat` e envie a
+  primeira mensagem como `username` ou `username - email`. A API procura o
+  usuário em `cache_users`; se não houver correspondência, consulta
+  `GET /api.php/v2/Administration/User` e atualiza o cache. Se o e-mail for
+  enviado, exige que os dois campos coincidam. Username sem e-mail precisa
+  identificar uma única conta. A API retorna um token local. Esse token precisa acompanhar
+  as próximas chamadas protegidas como `Authorization: Bearer <session_token>`;
+  ele é validado localmente e nunca é encaminhado ao GLPI. O token identifica a
+  sessão, mas o par nome/e-mail não comprova a identidade e o token fica em
+  memória até o servidor reiniciar.
+
+  Para consultar o GLPI, o servidor cria o JWT de serviço usando
+  `GLPI_USERNAME` e `GLPI_PASSWORD` (além das credenciais de cliente OAuth
+  configuradas no ambiente). O access token do cliente não é usado nas
+  consultas. `/health` e as rotas explícitas de emissão/renovação de token
+  continuam sendo fluxos separados.
 
   Os corpos de criação de chamados e acompanhamentos têm limites de tamanho.
-  `POST /api/chat` valida mensagem (até 4000 caracteres) e histórico (até 50
-  itens, apenas papéis `user`/`assistant`). A tarefa 3 processa a mensagem,
+  `POST /api/chat` valida mensagem (até 4000 caracteres) e aceita um
+  `session_id` opcional para a conversa; o histórico não é enviado pelo
+  cliente. A tarefa 3 processa a mensagem,
   extrai palavras-chave e retorna até três artigos relevantes consultados no
-  GLPI com o Bearer recebido. A resposta contém `pergunta`, `palavras_chave`,
-  `artigos` e `total`. O histórico continua aceito, mas ainda não participa da
-  busca, e não há geração de texto por IA. Veja `README-tarefa3.md` para
-  executar os testes e usar a collection Postman.
+  GLPI com o JWT obtido pelo servidor usando as credenciais do ambiente. A
+  resposta de identificação contém `session_id`, `session_token` e `user`; a
+  resposta de busca também inclui `message`, redigida pelo agente LangChain
+  com base na pergunta, no histórico persistido recuperado do SQLite e nos
+  resultados do GLPI. A busca também retorna `historico` com as últimas dez
+  mensagens e `session_id`. Os campos `pergunta`, `palavras_chave`, `artigos` e `total` permanecem
+  disponíveis para o frontend. Configure `LANGCHAIN_CHAT_MODEL` no formato
+  `provider:model` e as credenciais exigidas pelo provedor; sem essa
+  configuração, a busca retorna HTTP 503. Essa integração de IA afeta somente
+  `POST /api/chat`; os demais endpoints mantêm seus contratos REST.
+  Veja `README-tarefa3.md` para executar os testes e usar a collection Postman.
 
   Para testes locais, o bypass das validações adicionais e da autenticação
   Bearer pode ser habilitado somente com as duas variáveis:
@@ -241,12 +264,9 @@ Confirmado ao vivo:
   estiver ligada. Ele não desativa a validação estrutural de tipos do Pydantic.
   Não habilite essa configuração em ambientes compartilhados ou de produção.
 
-  **Autorização por endpoint:** o middleware não pré-valida o token chamando
-  `/Administration/User/Me`. Ele encaminha o Bearer para a rota GLPI solicitada
-  para evitar bloquear tokens cujo escopo permite tickets, mas não o endpoint
-  de usuário autenticado. Assim, `/api/me` pode retornar `403` por falta de
-  escopo mesmo quando `/api/tickets` funciona; o GLPI exige que esse escopo seja
-  concedido separadamente.
+  **Autorização por endpoint:** as rotas protegidas exigem um token de sessão
+  local válido. O cliente GLPI da aplicação usa as credenciais de serviço do
+  ambiente para obter o JWT encaminhado às operações no GLPI.
 
   A aplicação e suas rotas vivem em `src/main.py` (não em um módulo FastAPI
   separado). O fluxo OAuth existente também está exposto em
@@ -261,12 +281,10 @@ Confirmado ao vivo:
 - **Rotas disponíveis:** operações de autenticação OAuth, `/api/me`,
   `/api/tickets` (lista, detalhes, timeline e escrita), `/api/articles`,
   `/api/categories` e `/api/users`.
-- **Token e permissões:** envie `Authorization: Bearer <token>`. A aplicação
-  encaminha o token à rota GLPI solicitada; o próprio GLPI verifica o escopo.
-  `/api/me` pode responder `403` por falta de escopo mesmo quando
-  `/api/tickets` funciona. Essa regra por endpoint substitui qualquer
-  descrição anterior que diga que `/api/me` é chamado para pré-validar todas
-  as requisições.
+- **Token e permissões:** inicie uma sessão em `/api/chat` com o `username`
+  ou com o par `username - email`; envie o `session_token` retornado nas
+  rotas protegidas. O token é validado localmente. Para acessar o GLPI, o
+  servidor usa o JWT de serviço obtido com as credenciais do ambiente.
 - **Validação Pydantic:** middleware valida globalmente método, caminho,
   query string, JSON e tamanho máximo do corpo (1 MB). Modelos por rota
   também verificam campos: paginação, autenticação, chamados, acompanhamentos

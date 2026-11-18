@@ -1,6 +1,7 @@
 from pydantic import BaseModel, Field, field_validator
 
 from src.config.pydantic.base import APIInputModel
+from src.config.pydantic.session import IdentifiedUserData
 
 
 MAX_MESSAGE_LENGTH = 4_000
@@ -21,12 +22,21 @@ class HistoryMessage(BaseModel):
 
 
 class ChatResponse(BaseModel):
+    message: str
     session_id: str
     historico: list[HistoryMessage]
     pergunta: str
     palavras_chave: list[str]
     artigos: list[ArticleResult]
     total: int
+
+
+class ChatSessionResponse(BaseModel):
+    success: bool = True
+    message: str
+    session_id: str
+    session_token: str
+    user: IdentifiedUserData
 
 
 class ChatRequest(APIInputModel):
