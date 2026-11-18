@@ -1,7 +1,7 @@
 """Modelos Pydantic usados para validar as entradas da API."""
 
 from src.config.pydantic.auth import PasswordTokenRequest, RefreshTokenRequest
-from src.config.pydantic.chat import ChatHistoryMessage, ChatRequest
+from src.config.pydantic.chat import ChatRequest
 from src.config.pydantic.request import APIRequestEnvelope, PydanticRequestValidationMiddleware
 from src.config.pydantic.session import (
     IdentifiedUserData,

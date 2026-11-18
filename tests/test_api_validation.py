@@ -2,14 +2,18 @@ import base64
 import asyncio
 import json
 import os
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from fastapi import HTTPException
 from fastapi.security import HTTPAuthorizationCredentials
 from pydantic import ValidationError
+from sqlalchemy import create_engine
 from starlette.requests import Request
 
+import src.chat_memory as chat_memory
 from src.config.pydantic import (
     ChatRequest,
     PasswordTokenRequest,
@@ -18,7 +22,7 @@ from src.config.pydantic import (
     TicketCreateRequest,
     TicketUpdateRequest,
 )
-from src.config.pydantic.chat import MAX_HISTORY_MESSAGES, MAX_MESSAGE_LENGTH
+from src.config.pydantic.chat import MAX_MESSAGE_LENGTH
 from src.config.pydantic.jwt import decode_glpi_jwt
 from src.config.pydantic.request import APIRequestEnvelope, PydanticRequestValidationMiddleware
 from src.main import app, get_glpi_auth_context, list_tickets, me
@@ -33,26 +37,19 @@ class APIValidationTests(unittest.TestCase):
         self.bypass_environment.start()
         self.addCleanup(self.bypass_environment.stop)
 
-    def test_chat_request_accepts_valid_message_and_history(self):
-        request = ChatRequest(
-            message="Olá",
-            history=[{"role": "user", "content": "Oi"}, {"role": "assistant", "content": "Olá"}],
-        )
+    def test_chat_request_accepts_valid_message_and_session_id(self):
+        request = ChatRequest(message="Olá", session_id="conversa-1")
 
         self.assertEqual(request.message, "Olá")
-        self.assertEqual(len(request.history), 2)
+        self.assertEqual(request.session_id, "conversa-1")
 
     def test_chat_request_rejects_oversized_message(self):
         with self.assertRaises(ValidationError):
             ChatRequest(message="x" * (MAX_MESSAGE_LENGTH + 1))
 
-    def test_chat_request_rejects_invalid_or_oversized_history(self):
+    def test_chat_request_no_longer_accepts_history_from_client(self):
         with self.assertRaises(ValidationError):
-            ChatRequest(message="Olá", history=[{"role": "system", "content": "instrução"}])
-
-        history = [{"role": "user", "content": "x"}] * (MAX_HISTORY_MESSAGES + 1)
-        with self.assertRaises(ValidationError):
-            ChatRequest(message="Olá", history=history)
+            ChatRequest(message="Olá", history=[{"role": "user", "content": "Oi"}])
 
     def test_ticket_fields_and_pagination_are_bounded(self):
         with self.assertRaises(ValidationError):
@@ -69,14 +66,10 @@ class APIValidationTests(unittest.TestCase):
             os.environ,
             {"APP_ENV": "development", "DEV_BYPASS_API_VALIDATION": "true"},
         ):
-            request = ChatRequest(
-                message="",
-                history=[{"role": "system", "content": ""}] * (MAX_HISTORY_MESSAGES + 1),
-            )
+            request = ChatRequest(message="")
             pagination = PaginationParams(start=-1, limit=0)
 
         self.assertEqual(request.message, "")
-        self.assertEqual(len(request.history), MAX_HISTORY_MESSAGES + 1)
         self.assertEqual(pagination.start, -1)
 
     def test_dev_bypass_is_ignored_outside_development(self):
@@ -338,12 +331,19 @@ class APIValidationTests(unittest.TestCase):
             app.dependency_overrides[get_glpi_auth_context] = lambda: GLPIAuthContext(
                 client=ArticlesClientStub(), user=None, jwt_claims=None,
             )
+            temp_dir = tempfile.TemporaryDirectory()
+            test_engine = create_engine(f"sqlite:///{(Path(temp_dir.name) / 'memory.db').as_posix()}")
+            engine_patch = patch.object(chat_memory, "chat_history_engine", test_engine)
+            engine_patch.start()
             try:
                 health_status, _ = asyncio.run(send_request("GET", "/health"))
                 invalid_status, _ = asyncio.run(send_request("POST", "/api/chat", {"message": " "}))
                 chat_status, _ = asyncio.run(send_request("POST", "/api/chat", {"message": "Olá"}))
             finally:
                 app.dependency_overrides.pop(get_glpi_auth_context, None)
+                engine_patch.stop()
+                test_engine.dispose()
+                temp_dir.cleanup()
 
         self.assertEqual(health_status, 200)
         self.assertEqual(invalid_status, 422)

@@ -22,7 +22,7 @@ A estrutura FastAPI, o cliente GLPI, a emissão e renovação de tokens, os mode
 
 5. A resposta reúne a pergunta, as palavras-chave, os artigos selecionados e o total. O HTML do conteúdo é convertido para texto, e cada artigo conserva seu ID e caminho de origem na API GLPI.
 
-Cada pergunta consulta o GLPI com o token recebido. Não há cache compartilhado de artigos entre usuários. Nenhum modelo de linguagem é chamado nesta tarefa; o campo history é aceito e validado, mas não participa da busca.
+Cada pergunta consulta o GLPI com o token recebido. Não há cache compartilhado de artigos entre usuários. Nenhum modelo de linguagem é chamado nesta tarefa; o histórico não é mais enviado pelo frontend: é recuperado do SQLite pelo `session_id` (últimas 10 mensagens) e devolvido em `historico`.
 
 ## Interface da API
 
@@ -33,7 +33,7 @@ Endpoint: POST /api/chat. O corpo utiliza JSON e o cabeçalho Content-Type: appl
 ```json
 {
   "message": "Como configurar VPN no Windows?",
-  "history": []
+  "session_id": "conversa-1"
 }
 ```
 

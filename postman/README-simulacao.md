@@ -47,7 +47,7 @@ Abra **Busca natural** e clique em **Send**. O corpo enviado é:
 ```json
 {
   "message": "Oi, bom dia, estou tentando configurar a VPN no Windows e preciso de ajuda",
-  "history": []
+  "session_id": "conversa-1"
 }
 ```
 

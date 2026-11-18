@@ -47,3 +47,17 @@ def create_chat_memory(session_id: str) -> ConversationBufferWindowMemory:
         memory_key="chat_history",
         return_messages=True,
     )
+def load_history(memory: ConversationBufferWindowMemory) -> list[dict[str, str]]:
+    messages = memory.load_memory_variables({})["chat_history"]
+    return [
+        {"role": "user" if message.type == "human" else "assistant", "content": message.content}
+        for message in messages
+    ]
+
+
+def format_answer(result: dict[str, Any]) -> str:
+    articles = result["artigos"]
+    if not articles:
+        return "Não encontrei artigos para esta pergunta."
+    titles = "; ".join(f"[Artigo {article['id']}] {article['titulo']}" for article in articles)
+    return f"Artigos encontrados: {titles}"
