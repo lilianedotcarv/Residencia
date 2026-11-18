@@ -13,6 +13,7 @@ from sqlalchemy import create_engine
 
 import src.chat_memory as chat_memory
 from src.main import app
+from src.session_store import session_store
 
 
 class ArticleClientStub:
@@ -20,7 +21,7 @@ class ArticleClientStub:
         self.articles = articles if articles is not None else []
         self.status_code = status_code
         self.error = error
-        self.access_token = None
+        self.access_token = "service-glpi-jwt"
         self.calls = []
 
     def knowledgebase_articles(self, *, start, limit):
@@ -90,12 +91,39 @@ class ChatAPITests(unittest.TestCase):
         engine_patch = patch.object(chat_memory, "chat_history_engine", test_engine)
         engine_patch.start()
         self.addCleanup(engine_patch.stop)
+        session_store.clear()
+        self.addCleanup(session_store.clear)
+
+        def explain_results(question, result, history):
+            del question, history
+            articles = result["artigos"]
+            if not articles:
+                return "Não encontrei artigos para esta pergunta."
+            titles = "; ".join(
+                f"[Artigo {article['id']}] {article['titulo']}"
+                for article in articles
+            )
+            return f"Artigos encontrados: {titles}"
+
+        agent_patch = patch(
+            "src.main.generate_chat_response",
+            side_effect=explain_results,
+        )
+        self.agent = agent_patch.start()
+        self.addCleanup(agent_patch.stop)
 
     def call(self, client, payload=None, **kwargs):
+        token = kwargs.get("token", "test-token")
+        if token is not None:
+            session_store.save_session(
+                f"test-session-{token}",
+                {"id": 8 if token == "user-b" else 7, "name": "test-user"},
+                token=token,
+            )
         with patch("src.main._new_glpi_client", return_value=client):
             return asyncio.run(send_chat(payload, **kwargs))
 
-    def test_natural_question_uses_bearer_and_returns_relevant_article(self):
+    def test_natural_question_uses_session_token_and_returns_relevant_article(self):
         client = ArticleClientStub([
             {"id": 1, "name": "Configurar VPN Windows", "content": "<p>Configure a VPN no Windows.</p>"},
             {"id": 2, "name": "Configurar VPN macOS", "content": "<p>Configure a VPN no macOS.</p>"},
@@ -105,13 +133,20 @@ class ChatAPITests(unittest.TestCase):
         status, body = self.call(client, {"message": question}, token="user-a-token")
 
         self.assertEqual(status, 200)
+        self.assertEqual(
+            body["message"],
+            "Artigos encontrados: [Artigo 1] Configurar VPN Windows",
+        )
         self.assertEqual(body["pergunta"], question.strip())
         self.assertIn("vpn", body["palavras_chave"])
         self.assertIn("windows", body["palavras_chave"])
         self.assertEqual(body["total"], 1)
         self.assertEqual([article["id"] for article in body["artigos"]], [1])
         self.assertEqual(body["artigos"][0]["conteudo"], "Configure a VPN no Windows.")
-        self.assertEqual(client.calls, [("user-a-token", 0, 50)])
+        self.assertEqual(client.calls, [("service-glpi-jwt", 0, 50)])
+        self.agent.assert_called_once()
+        self.assertEqual(self.agent.call_args.args[0], question)
+        self.assertEqual(self.agent.call_args.args[1]["artigos"][0]["id"], 1)
 
     def test_invalid_message_is_rejected_before_glpi_query(self):
         for payload in (
@@ -130,11 +165,20 @@ class ChatAPITests(unittest.TestCase):
         self.assertEqual(status, 422)
         self.assertEqual(client.calls, [])
 
-    def test_missing_bearer_is_rejected(self):
+    def test_chat_without_bearer_requires_initial_user_identification(self):
         client = ArticleClientStub()
-        status, _ = self.call(client, {"message": "VPN"}, token=None)
+        status, _ = self.call(client, {"message": "ana - "}, token=None)
+        self.assertEqual(status, 400)
+        self.assertEqual(client.calls, [])
+
+    def test_followup_chat_rejects_invalid_bearer_before_glpi_or_agent(self):
+        client = ArticleClientStub()
+        with patch("src.main._new_glpi_client", return_value=client):
+            status, _ = asyncio.run(send_chat({"message": "VPN"}, token="invalid-token"))
+
         self.assertEqual(status, 401)
         self.assertEqual(client.calls, [])
+        self.agent.assert_not_called()
 
     def test_glpi_auth_and_rate_limit_errors_are_preserved_without_raw_details(self):
         for upstream_status in (401, 403, 429):
@@ -198,7 +242,10 @@ class ChatAPITests(unittest.TestCase):
         status, body = self.call(client, {"message": "VPN Windows"})
         self.assertEqual(status, 200)
         self.assertEqual([article["id"] for article in body["artigos"]], [51])
-        self.assertEqual(client.calls, [("test-token", 0, 50), ("test-token", 50, 50)])
+        self.assertEqual(
+            client.calls,
+            [("service-glpi-jwt", 0, 50), ("service-glpi-jwt", 50, 50)],
+        )
 
     def test_requests_do_not_share_articles_between_users(self):
         first = ArticleClientStub([{"id": 1, "name": "VPN Windows", "content": "Configurar VPN"}])
@@ -208,7 +255,7 @@ class ChatAPITests(unittest.TestCase):
         self.assertEqual((first_status, second_status), (200, 200))
         self.assertEqual([article["id"] for article in first_body["artigos"]], [1])
         self.assertEqual(second_body["artigos"], [])
-        self.assertEqual(second.calls, [("user-b-token", 0, 50)])
+        self.assertEqual(second.calls, [("service-glpi-jwt", 0, 50)])
 
     def test_history_is_restored_from_sqlite_for_the_same_session(self):
         articles = [{"id": 1, "name": "VPN Windows", "content": "Configurar VPN Windows"}]

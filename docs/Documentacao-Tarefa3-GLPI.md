@@ -12,21 +12,28 @@ A estrutura FastAPI, o cliente GLPI, a emissão e renovação de tokens, os mode
 
 ## Funcionamento da busca
 
-1. A API recebe message, valida se o texto não está vazio e aplica o limite de 4.000 caracteres. O token é recebido no cabeçalho Authorization com o esquema Bearer.
+1. A API recebe `message`, valida se o texto não está vazio e aplica o limite de 4.000 caracteres. Na primeira chamada sem Bearer, a mensagem pode ser apenas o `username` ou `username - email`. A busca usa `cache_users`; sem e-mail, o username deve corresponder a uma única conta.
 
-2. O texto é normalizado quanto a maiúsculas, acentos e formas como e-mail/email e wi-fi/wifi. Saudações, palavras de ligação e alguns termos conversacionais são removidos; as palavras-chave são retornadas sem repetição.
+2. O token local identifica a sessão e é exigido nas chamadas protegidas da aplicação, mas não autentica a identidade: qualquer pessoa que conheça o par cadastrado pode solicitá-lo. Ele nunca é encaminhado ao GLPI; o backend usa as credenciais GLPI configuradas no servidor para obter o JWT de serviço usado nas consultas.
 
-3. O backend consulta as páginas de artigos acessíveis ao token do usuário no GLPI. As palavras-chave orientam uma filtragem local dos artigos recebidos.
+3. O texto da pergunta é normalizado quanto a maiúsculas, acentos e formas como e-mail/email e wi-fi/wifi. Saudações, palavras de ligação e alguns termos conversacionais são removidos; as palavras-chave são retornadas sem repetição.
 
-4. A busca lexical usa pontuação BM25, favorece correspondências no título e diferencia plataformas indicadas na pergunta, como Windows e macOS. Resultados pouco relacionados ao tema são descartados.
+4. O backend consulta as páginas de artigos no GLPI. As palavras-chave orientam uma filtragem local dos artigos recebidos.
 
-5. A resposta reúne a pergunta, as palavras-chave, os artigos selecionados e o total. O HTML do conteúdo é convertido para texto, e cada artigo conserva seu ID e caminho de origem na API GLPI.
+5. A busca lexical usa pontuação BM25, favorece correspondências no título e diferencia plataformas indicadas na pergunta, como Windows e macOS. Resultados pouco relacionados ao tema são descartados.
 
-Cada pergunta consulta o GLPI com o token recebido. Não há cache compartilhado de artigos entre usuários. Nenhum modelo de linguagem é chamado nesta tarefa; o histórico não é mais enviado pelo frontend: é recuperado do SQLite pelo `session_id` (últimas 10 mensagens) e devolvido em `historico`.
+6. O agente LangChain recebe a pergunta, o histórico da conversa e o resultado estruturado da busca para produzir uma resposta clara em português. A resposta também preserva a pergunta, as palavras-chave, os artigos selecionados e o total. O HTML do conteúdo é convertido para texto, e cada artigo conserva seu ID e caminho de origem na API GLPI.
+
+O histórico é recuperado do SQLite pelo `session_id` (últimas 10 mensagens) e
+devolvido em `historico`; o frontend não precisa reenviá-lo. Não há cache
+compartilhado de artigos entre usuários. Configure `LANGCHAIN_CHAT_MODEL` no
+formato `provider:model` e as credenciais exigidas pelo provedor escolhido.
+Sem essa configuração, a rota retorna HTTP 503. Somente `POST /api/chat` passa
+pelo agente; os demais endpoints REST mantêm seus contratos.
 
 ## Interface da API
 
-Endpoint: POST /api/chat. O corpo utiliza JSON e o cabeçalho Content-Type: application/json. Para autenticação, utiliza-se Authorization: Bearer <access_token>. O token é obtido previamente pelo fluxo Create Token da collection.
+Endpoint: `POST /api/chat`. O corpo utiliza JSON e o cabeçalho `Content-Type: application/json`. Para iniciar uma sessão, omita `Authorization` e envie `message` como `username` ou `username - email`. O backend procura o usuário no cache e, quando necessário, consulta a API de usuários do GLPI e atualiza o cache. Use o campo `session_token` retornado como `Authorization: Bearer <session_token>` nas próximas mensagens. Esse token identifica a sessão da aplicação; o backend usa `GLPI_USERNAME` e `GLPI_PASSWORD` para obter as credenciais de serviço exigidas nas consultas ao GLPI.
 
 ### Exemplo de entrada
 
@@ -41,6 +48,9 @@ Endpoint: POST /api/chat. O corpo utiliza JSON e o cabeçalho Content-Type: appl
 
 | Campo | Descrição |
 | --- | --- |
+| message | Resposta clara em português gerada pelo agente LangChain. |
+| session_id | Identificador da conversa, reutilizado para recuperar o histórico. |
+| historico | Até dez mensagens anteriores da conversa, recuperadas do SQLite. |
 | pergunta | Texto recebido, com espaços externos removidos. |
 | palavras_chave | Lista dos termos extraídos e normalizados. |
 | artigos | Lista com até três resultados relevantes. |
@@ -61,7 +71,7 @@ Cada artigo contém id, titulo, conteudo, pontuacao, termos_encontrados e fonte_
 
 A consulta utiliza GET /api.php/v2/Knowledgebase/Article, paginada por start e limit. O endereço de fonte retornado identifica o artigo no GLPI, por exemplo /api.php/v2/Knowledgebase/Article/1.
 
-Autenticação ausente retorna 401; entrada inválida, 422; timeout da consulta, 504. Os erros 401, 403 e 429 do GLPI são preservados, enquanto outras falhas externas são convertidas em 502 com mensagem controlada.
+Identificação inicial inválida retorna 400; Bearer inválido retorna 401; entrada inválida retorna 422. Timeout da consulta ao GLPI ou ao agente retorna 504. Os erros 401, 403 e 429 do GLPI são preservados, enquanto outras falhas externas são convertidas em 502 com mensagem controlada.
 
 ## Validação e critérios de aceitação
 
@@ -81,7 +91,7 @@ A validação de integração ocorreu em 22/10/2026 no glpi-agent-lab, iniciado 
 | Assinatura de e-mail | 200 | ID 22 — Configurar assinatura padrão de e-mail. |
 | Assunto telescópio | 200 | Nenhum artigo; total 0. Ausência do assunto conferida no corpus. |
 | Mensagem vazia | 422 | Entrada rejeitada com explicação. |
-| Sem Bearer | 401 | Requisição rejeitada por autenticação ausente. |
+| Sem Bearer e sem identificação válida | 400 | Identificação inicial inválida. |
 | VPN no macOS | 200 | ID 2 — Configurar a VPN corporativa no macOS. |
 
 ### Evidências automatizadas e manuais
@@ -105,11 +115,11 @@ A porta 8080 pertence ao GLPI; a porta 8000, ao backend do projeto. A porta 8001
 
 ## Limitações e estado da entrega
 
-A busca depende da correspondência lexical e pode não reconhecer sinônimos ou formulações muito diferentes do texto dos artigos. A relevância deve ser reavaliada em outras bases e com outros perfis de acesso. O contexto de conversas e a geração de respostas por IA ficam fora do escopo desta tarefa.
+A busca depende da correspondência lexical e pode não reconhecer sinônimos ou formulações muito diferentes do texto dos artigos. A relevância deve ser reavaliada em outras bases e com outros perfis de acesso. A geração da resposta depende da disponibilidade e da configuração do provedor LangChain.
 
 A consulta é limitada a 20 páginas de até 50 artigos. Se não for possível confirmar o fim da paginação nesse limite, a API retorna erro para evitar uma resposta baseada em dados parciais. Cada busca também depende da disponibilidade do GLPI.
 
-No laboratório, tokens malformados ou com assinatura inválida receberam HTTP 400 do GLPI, convertido em 502 pelo tratamento atual do backend. Esse comportamento foi documentado. O caso de Bearer ausente retorna 401.
+No laboratório, tokens malformados ou com assinatura inválida receberam HTTP 400 do GLPI, convertido em 502 pelo tratamento atual do backend. Esse comportamento foi documentado. A identificação inicial sem Bearer requer um username válido; chamadas subsequentes exigem o token de sessão.
 
 A contribuição foi publicada na branch feat/tarefa3-processamento-perguntas e está em revisão no [Pull Request #5](https://github.com/noturfrnd/glpi-chat-bot/pull/5), com evidências registradas. Conforme a solicitação de revisão, as duas collections do Postman são distribuídas separadamente do repositório. A integração à main depende da revisão da equipe.
 

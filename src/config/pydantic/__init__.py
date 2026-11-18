@@ -14,7 +14,6 @@ from src.config.pydantic.types import PaginationParams
 
 __all__ = [
     "APIRequestEnvelope",
-    "ChatHistoryMessage",
     "ChatRequest",
     "FollowupRequest",
     "IdentifiedUserData",
